@@ -12,7 +12,7 @@ coverage.xml
 .ruff_cache/
 .mypy_cache/
 
-# Forge build-notes — internal, not for public consumption
+# Local build/session notes — not for public consumption
 SESSION-RESUME.md
 
 # Host-specific compose overrides stay local
