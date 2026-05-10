@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    name: Lint and Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint with ruff
+        run: |
+          ruff check src tests
+          ruff format --check src tests
+
+      - name: Run unit tests
+        env:
+          # Live smoke tests are gated by RUN_LIVE=1; CI runs unit tests only.
+          RUN_LIVE: "0"
+        run: |
+          pytest -ra --strict-markers \
+            --ignore=tests/test_smoke_live.py

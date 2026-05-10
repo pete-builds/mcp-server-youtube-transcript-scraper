@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+.env
+.coverage
+coverage.xml
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Forge build-notes — internal, not for public consumption
+SESSION-RESUME.md
+
+# Host-specific compose overrides stay local
+docker-compose.override.yml
