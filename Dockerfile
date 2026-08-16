@@ -15,12 +15,10 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Install runtime deps from requirements.in (pinned versions). v0.1 ships
-# without a hash-locked file; the public-repo CI will generate one before
-# 1.0. Versions are exact-pinned in requirements.in so builds are still
-# deterministic for a given image build.
-COPY requirements.in ./requirements.in
-RUN pip install --no-cache-dir --target /wheels -r requirements.in
+# Install from the hash-locked requirements.lock (pip-compile --generate-hashes).
+# --require-hashes refuses anything that doesn't match a pinned sha256.
+COPY requirements.lock ./requirements.lock
+RUN pip install --no-cache-dir --require-hashes --target /wheels -r requirements.lock
 
 COPY pyproject.toml README.md ./
 COPY src/ ./src/
