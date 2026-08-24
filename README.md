@@ -75,7 +75,7 @@ claude mcp add youtube -- mcp-youtube
 ```
 
 No `.env` is needed for any of this. The defaults are the local-friendly ones:
-stdio transport, loopback bind, plain-text logs on stderr.
+stdio transport, which binds no port at all, and plain-text logs on stderr.
 
 ### As an always-on server (Docker)
 

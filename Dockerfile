@@ -56,9 +56,9 @@ WORKDIR /app
 COPY --from=builder /wheels /app/site-packages
 RUN chown -R mcp:mcp /app
 
-# The package defaults to the stdio transport bound to localhost, because that
-# is what a person installing this on their laptop wants. A container wants the
-# opposite, so pin it here rather than relying on compose to remember.
+# The package defaults to the stdio transport, which binds nothing, because that
+# is what a person installing this on their laptop wants. A container wants a
+# listener, so pin it here rather than relying on compose to remember.
 ENV MCP_TRANSPORT=http \
     MCP_HOST=0.0.0.0 \
     MCP_PORT=3716 \

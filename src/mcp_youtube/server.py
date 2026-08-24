@@ -13,9 +13,11 @@ import argparse
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
+from pydantic import ValidationError
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -264,12 +266,23 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--port",
-        type=int,
+        type=_port_number,
         default=None,
         help="Port for --transport http. Overrides MCP_PORT (default 3716).",
     )
     parser.add_argument("--version", action="version", version=f"mcp-youtube {__version__}")
     return parser.parse_args(argv)
+
+
+def _port_number(value: str) -> int:
+    """argparse type for --port, matching the ge=1/le=65535 on the settings field."""
+    try:
+        port = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"port must be a whole number, got {value!r}") from None
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError(f"port must be between 1 and 65535, got {port}")
+    return port
 
 
 def _resolve_transport(args: argparse.Namespace) -> str:
@@ -278,15 +291,21 @@ def _resolve_transport(args: argparse.Namespace) -> str:
     This has to run before ``Settings`` is built, because the answer determines
     whether reading a ``.env`` is safe at all. Precedence is flag, then real
     environment, then the stdio default.
+
+    Accepts what ``Settings`` would reject (``HTTP``, ``" http "``, and the
+    empty string a bare ``MCP_TRANSPORT=`` line or a compose ``MCP_TRANSPORT: ""``
+    produces) so the caller can canonicalise it. Anything that is not a
+    near-miss gets a one-line message rather than a pydantic traceback.
     """
     if args.transport:
         return str(args.transport)
-    from_env = os.environ.get("MCP_TRANSPORT", "").strip().lower()
-    if from_env in ("stdio", "http"):
-        return from_env
-    if from_env:
-        raise SystemExit(f"MCP_TRANSPORT must be 'stdio' or 'http', got {from_env!r}")
-    return "stdio"
+    raw = os.environ.get("MCP_TRANSPORT", "")
+    normalized = raw.strip().lower()
+    if not normalized:
+        return "stdio"
+    if normalized not in ("stdio", "http"):
+        raise SystemExit(f"MCP_TRANSPORT must be 'stdio' or 'http', got {raw!r}")
+    return normalized
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -305,15 +324,28 @@ def main(argv: list[str] | None = None) -> None:
     # would let an unrelated file crash us (LOG_LEVEL=debug is not a valid
     # level here) or silently turn us into an HTTP server the client can never
     # talk to. So stdio reads real environment variables only.
-    settings = load_settings(env_file=None if transport == "stdio" else ".env")
+    # Canonicalise before Settings reads it. _resolve_transport deliberately
+    # accepts near-misses that the strict Literal on the field would reject, and
+    # without this the process dies on a pydantic traceback one line below,
+    # before logging is configured and with nothing actionable on stderr.
+    os.environ["MCP_TRANSPORT"] = transport
 
-    # Safe without validate_assignment because _resolve_transport only ever
-    # returns a value argparse or the check above already validated.
-    settings.mcp_transport = transport
+    # Overrides go through pydantic rather than being assigned onto the model,
+    # because validate_assignment is off: a direct `settings.mcp_port = 70000`
+    # would stick and then fail deep inside uvicorn instead of here.
+    overrides: dict[str, object] = {}
     if args.host is not None:
-        settings.mcp_host = args.host
+        overrides["mcp_host"] = args.host
     if args.port is not None:
-        settings.mcp_port = args.port
+        overrides["mcp_port"] = args.port
+
+    try:
+        settings = load_settings(
+            env_file=None if transport == "stdio" else ".env",
+            **overrides,
+        )
+    except ValidationError as exc:
+        raise SystemExit(f"invalid configuration:\n{exc}") from exc
 
     # Under stdio a human is usually watching the terminal, so plain text beats
     # JSON lines. An explicitly configured LOG_FORMAT still wins; model_fields_set
@@ -322,6 +354,13 @@ def main(argv: list[str] | None = None) -> None:
     if transport == "stdio" and "log_format" not in settings.model_fields_set:
         fmt = "text"
     configure_logging(level=settings.log_level, fmt=fmt)
+
+    if transport == "stdio" and Path(".env").is_file():
+        logger.warning(
+            "ignoring the .env in this directory: the stdio transport reads real "
+            "environment variables only. Set them in your MCP client's env block.",
+            extra={"cwd": str(Path.cwd())},
+        )
 
     logger.info(
         "MCP YouTube starting",

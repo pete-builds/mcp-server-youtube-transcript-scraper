@@ -113,12 +113,16 @@ class Settings(BaseSettings):
         }
 
 
-def load_settings(*, env_file: str | None = ".env") -> Settings:
+def load_settings(*, env_file: str | None = ".env", **overrides: object) -> Settings:
     """Build a Settings instance from the environment. Raises on invalid config.
 
     ``env_file=None`` skips dotenv loading entirely. The stdio entrypoint uses
     that: an MCP client spawns the server with the *user's project* as the
     working directory, and reading whatever ``.env`` happens to sit there would
     let an unrelated file reconfigure this server. See ``server.main``.
+
+    Keyword overrides (e.g. ``mcp_port=9000``) go through pydantic like any
+    other source, so a CLI flag gets the same range and type checks an env var
+    would get.
     """
-    return Settings(_env_file=env_file)
+    return Settings(_env_file=env_file, **overrides)

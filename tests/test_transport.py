@@ -14,20 +14,44 @@ import sys
 
 import pytest
 
+from mcp_youtube import server as server_module
 from mcp_youtube.config import Settings, load_settings
 from mcp_youtube.logging_setup import configure_logging
 from mcp_youtube.server import _parse_args, _resolve_transport
 
+#: Every setting this module asserts a default for. Exported in a developer's
+#: shell, any one of them turns a green suite red for reasons unrelated to the
+#: change under test.
+_SETTING_VARS = (
+    "MCP_TRANSPORT",
+    "MCP_HOST",
+    "MCP_PORT",
+    "LOG_LEVEL",
+    "LOG_FORMAT",
+    "DEFAULT_LANGUAGE",
+    "FALLBACK_LANGUAGES",
+    "RATE_LIMIT_MIN_SECONDS",
+    "RATE_LIMIT_MAX_SECONDS",
+)
+
 
 @pytest.fixture
-def clean_settings(monkeypatch: pytest.MonkeyPatch, tmp_path):
-    """Build Settings with no dotenv in play.
+def isolated_env(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    """Neutralise BOTH config sources: the ambient dotenv and the real environment.
 
-    Without this, a developer who followed the README's Docker instructions
-    (`cp .env.example .env`) has a .env in the repo root, and these
-    default-value assertions fail on their machine but pass in CI.
+    A developer who followed the README's Docker instructions has a .env in the
+    repo root, and one who is debugging has MCP_TRANSPORT exported. Either used
+    to fail these assertions locally while CI stayed green.
     """
     monkeypatch.chdir(tmp_path)
+    for name in _SETTING_VARS:
+        monkeypatch.delenv(name, raising=False)
+    return tmp_path
+
+
+@pytest.fixture
+def clean_settings(isolated_env):
+    """Build Settings with neither a dotenv nor an inherited environment."""
     return lambda: Settings(_env_file=None)
 
 
@@ -67,30 +91,26 @@ def test_transport_rejects_unknown_value(monkeypatch: pytest.MonkeyPatch) -> Non
 # ---------------------------------------------------------------------------
 
 
-def test_load_settings_can_skip_dotenv(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+def test_load_settings_can_skip_dotenv(isolated_env) -> None:
     """A project .env must not be able to turn a stdio server into an http one."""
-    (tmp_path / ".env").write_text("MCP_TRANSPORT=http\nMCP_HOST=0.0.0.0\n")
-    monkeypatch.chdir(tmp_path)
+    (isolated_env / ".env").write_text("MCP_TRANSPORT=http\nMCP_HOST=0.0.0.0\n")
 
     assert load_settings().mcp_transport == "http"  # http path still reads it
     assert load_settings(env_file=None).mcp_transport == "stdio"  # stdio ignores it
 
 
-def test_unrelated_dotenv_cannot_crash_stdio(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+def test_unrelated_dotenv_cannot_crash_stdio(isolated_env) -> None:
     """LOG_LEVEL=debug is ordinary in other projects and is invalid here."""
-    (tmp_path / ".env").write_text("LOG_LEVEL=debug\n")
-    monkeypatch.chdir(tmp_path)
+    (isolated_env / ".env").write_text("LOG_LEVEL=debug\n")
 
     with pytest.raises(ValueError):
         load_settings()
     assert load_settings(env_file=None).log_level == "INFO"
 
 
-def test_resolve_transport_ignores_dotenv(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+def test_resolve_transport_ignores_dotenv(isolated_env) -> None:
     """Transport is decided before any dotenv is read, or the guard is circular."""
-    (tmp_path / ".env").write_text("MCP_TRANSPORT=http\n")
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("MCP_TRANSPORT", raising=False)
+    (isolated_env / ".env").write_text("MCP_TRANSPORT=http\n")
 
     assert _resolve_transport(_parse_args([])) == "stdio"
 
@@ -158,3 +178,135 @@ def test_logging_never_writes_to_stdout(fmt: str, monkeypatch: pytest.MonkeyPatc
 
     assert out.getvalue() == ""
     assert "canary" in err.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# main() wiring
+#
+# The helpers above are individually correct; these assert that main() actually
+# combines them. Without this, the dotenv guard and the LOG_FORMAT fix can both
+# regress silently while every other test stays green.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def run_main(monkeypatch: pytest.MonkeyPatch):
+    """Call main() without starting a server, capturing what it decided."""
+
+    def _run(argv):
+        captured: dict[str, object] = {}
+
+        class StubServer:
+            def run(self, **kwargs):
+                captured["run_kwargs"] = kwargs
+
+        real_load = server_module.load_settings
+
+        def spy_load(**kwargs):
+            captured["env_file"] = kwargs.get("env_file", ".env")
+            captured["overrides"] = {k: v for k, v in kwargs.items() if k != "env_file"}
+            return real_load(**kwargs)
+
+        monkeypatch.setattr(server_module, "load_settings", spy_load)
+        monkeypatch.setattr(server_module, "build_server", lambda settings: StubServer())
+        monkeypatch.setattr(
+            server_module,
+            "configure_logging",
+            lambda level, fmt: captured.update(log_level=level, log_fmt=fmt),
+        )
+        server_module.main(argv)
+        return captured
+
+    return _run
+
+
+def test_main_skips_dotenv_on_stdio(run_main, isolated_env) -> None:
+    """The whole stdio install story rests on this one argument."""
+    assert run_main([])["env_file"] is None
+
+
+def test_main_reads_dotenv_on_http(run_main, isolated_env) -> None:
+    assert run_main(["--transport", "http"])["env_file"] == ".env"
+
+
+def test_main_defaults_stdio_logs_to_text(run_main, isolated_env) -> None:
+    """A human is watching the terminal; JSON lines are the wrong default there."""
+    assert run_main([])["log_fmt"] == "text"
+
+
+def test_main_honours_explicit_log_format_from_dotenv(run_main, isolated_env) -> None:
+    """The regression guard for the os.environ-vs-dotenv bug.
+
+    A dotenv value never reaches os.environ, so checking os.environ here would
+    silently override a LOG_FORMAT the user configured on purpose.
+    """
+    (isolated_env / ".env").write_text("LOG_FORMAT=json\n")
+    assert run_main(["--transport", "http"])["log_fmt"] == "json"
+
+
+def test_main_honours_explicit_log_format_from_environ(
+    run_main, isolated_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("LOG_FORMAT", "json")
+    assert run_main([])["log_fmt"] == "json"
+
+
+def test_main_passes_cli_overrides_through_pydantic(run_main, isolated_env) -> None:
+    captured = run_main(["--transport", "http", "--host", "127.0.0.1", "--port", "9999"])
+    assert captured["overrides"] == {"mcp_host": "127.0.0.1", "mcp_port": 9999}
+    assert captured["run_kwargs"]["host"] == "127.0.0.1"
+    assert captured["run_kwargs"]["port"] == 9999
+
+
+def test_main_stdio_run_takes_no_host_or_port(run_main, isolated_env) -> None:
+    """Passing host/port to a stdio run is meaningless and FastMCP may reject it."""
+    kwargs = run_main([])["run_kwargs"]
+    assert kwargs["transport"] == "stdio"
+    assert "host" not in kwargs and "port" not in kwargs
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("HTTP", "streamable-http"), (" http ", "streamable-http"), ("Stdio", "stdio")],
+)
+def test_main_canonicalises_near_miss_transport(
+    run_main, isolated_env, monkeypatch: pytest.MonkeyPatch, value: str, expected: str
+) -> None:
+    """These pass the friendly resolver, so they must not then die in pydantic."""
+    monkeypatch.setenv("MCP_TRANSPORT", value)
+    captured = run_main([])
+    assert captured["run_kwargs"]["transport"] == expected
+
+
+def test_main_treats_empty_transport_as_unset(
+    run_main, isolated_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`MCP_TRANSPORT=` in an env_file and `MCP_TRANSPORT: ""` in compose both yield this."""
+    monkeypatch.setenv("MCP_TRANSPORT", "")
+    assert run_main([])["run_kwargs"]["transport"] == "stdio"
+
+
+def test_main_rejects_garbage_transport_without_traceback(
+    isolated_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MCP_TRANSPORT", "smoke-signal")
+    with pytest.raises(SystemExit) as exc:
+        server_module.main([])
+    assert "smoke-signal" in str(exc.value)
+
+
+def test_main_reports_bad_config_as_a_message(
+    isolated_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An invalid env var should be one line on stderr, not a pydantic traceback."""
+    monkeypatch.setenv("LOG_LEVEL", "debug")
+    with pytest.raises(SystemExit) as exc:
+        server_module.main([])
+    assert "invalid configuration" in str(exc.value)
+
+
+def test_port_flag_is_range_checked() -> None:
+    """Assigning onto the model bypassed ge/le and failed deep inside uvicorn."""
+    for bad in ["70000", "0", "-1", "notanumber"]:
+        with pytest.raises(SystemExit):
+            _parse_args(["--port", bad])
