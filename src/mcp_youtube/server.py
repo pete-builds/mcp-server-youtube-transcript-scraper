@@ -178,13 +178,19 @@ def build_server(
     async def fetch_video_metadata(url_or_id: str) -> str:
         """Fetch a YouTube video's title and channel.
 
-        Uses YouTube's public oEmbed endpoint, not the transcript scraper, so
-        this is NOT subject to the 5-10 second throttle on ``fetch_transcript``
-        and is safe to call back to back.
+        Uses YouTube's public oEmbed endpoint rather than the transcript
+        scraper, so it carries a light one second interval instead of
+        ``fetch_transcript``'s five to ten. It is the same source IP, and
+        YouTube blocks per IP, so it is not free to hammer.
 
         Intended to run before ``format_transcript_as_research``, which needs a
         title and channel to produce usable frontmatter and cannot look them up
         itself.
+
+        **Check ``metadata_available`` before giving up.** When it is false,
+        YouTube answered but declined to describe the video, which usually means
+        embedding is disabled. The transcript is normally still fetchable, so
+        continue to ``fetch_transcript`` and pass an empty title through.
 
         Args:
             url_or_id: A YouTube URL (``https://youtu.be/<id>``,
@@ -193,10 +199,13 @@ def build_server(
 
         Returns:
             Success: ``{"data": {"video_id": str, "title": str, "channel": str,
-                "url": str, "thumbnail_url": str}}``.
+                "url": str, "thumbnail_url": str, "metadata_available": bool,
+                "reason": str}}``. ``metadata_available`` is false, with ``title``
+            and ``channel`` empty, when embedding is disabled or oEmbed returned
+            no title; the video is usually still readable via ``fetch_transcript``.
             Failure: ``{"error", "code", "details"}`` with code in
             ``{INVALID_INPUT, NOT_FOUND, RATE_LIMITED, UPSTREAM_DOWN, INTERNAL}``.
-            ``NOT_FOUND`` covers private, removed, and embedding-disabled videos.
+            ``NOT_FOUND`` means no such video.
 
         Example:
             ``fetch_video_metadata("https://www.youtube.com/watch?v=dQw4w9WgXcQ")``
@@ -228,6 +237,8 @@ def build_server(
                 "channel": meta.channel,
                 "url": meta.url,
                 "thumbnail_url": meta.thumbnail_url,
+                "metadata_available": meta.available,
+                "reason": meta.reason,
             }
         )
 
