@@ -13,10 +13,11 @@ library underneath. Self-throttles aggressively so YouTube doesn't ban your IP.
 
 ## What it does
 
-Two tools, single-user, stateless:
+Three tools, single-user, stateless:
 
 | Tool | What it does |
 |------|--------------|
+| `fetch_video_metadata(url_or_id)` | Returns the video's title and channel via YouTube's public oEmbed endpoint. Not throttled, because it does not touch the transcript scraper. `format_transcript_as_research` needs these to build usable frontmatter and cannot look them up itself. |
 | `fetch_transcript(url_or_id, language?)` | Pulls captions for a YouTube video. Accepts URLs or bare 11-char IDs. Returns transcript text with `[MM:SS]` timestamps plus metadata (language, generated/manual, snippet count, duration). |
 | `format_transcript_as_research(transcript, video_id, title?, channel?, url?, language?, is_generated?)` | Wraps a fetched transcript in a frontmatter block (title, date, source, summary, type, status) and returns the rendered Markdown plus a slug and suggested path. The MCP server does not write to disk — the calling agent persists the file in its own workspace. |
 
@@ -109,6 +110,23 @@ mcp-youtube --transport http --host 127.0.0.1     # loopback only
 
 The first call takes 5-10 seconds on purpose. See
 [Anti-ban hardening](#anti-ban-hardening).
+
+## Turning a video into a research document
+
+The three tools are designed to compose in this order. Ask your assistant to do
+this and it will chain them itself:
+
+1. `fetch_video_metadata(url)` for the title and channel.
+2. `fetch_transcript(url)` for the timestamped text.
+3. `format_transcript_as_research(transcript, video_id, title, channel, ...)`
+   returns rendered markdown with a frontmatter block, a slug, and a suggested
+   path.
+
+The server never writes to disk. Step 3 hands the markdown back and your
+assistant saves it wherever your notes live. That keeps the server stateless and
+means it needs no volume mount and no filesystem access.
+
+Only step 2 is throttled.
 
 ## Transports
 

@@ -1,6 +1,6 @@
 """MCP YouTube — fetch transcripts and shape them as research-ready markdown.
 
-Two tools, single-user, stateless. Self-throttles to keep YouTube from
+Three tools, single-user, stateless. Self-throttles to keep YouTube from
 banning the server's IP (1 request per 5-10 seconds with random jitter).
 
 Transport: stdio by default (local, client-spawned); Streamable HTTP when
@@ -23,6 +23,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from mcp_youtube import __version__
+from mcp_youtube.clients.metadata import YouTubeMetadataClient
 from mcp_youtube.clients.youtube import (
     TranscriptError,
     YouTubeTranscriptClient,
@@ -63,12 +64,15 @@ def build_server(
     settings: Settings,
     *,
     client: YouTubeTranscriptClient | None = None,
+    metadata_client: YouTubeMetadataClient | None = None,
 ) -> FastMCP:
     """Construct a FastMCP instance with both tools wired up.
 
     Tests can pass a mocked ``YouTubeTranscriptClient`` to bypass the
     upstream library entirely.
     """
+    if metadata_client is None:
+        metadata_client = YouTubeMetadataClient()
     if client is None:
         client = YouTubeTranscriptClient(
             rate_limit_min_seconds=settings.rate_limit_min_seconds,
@@ -167,6 +171,63 @@ def build_server(
                 "snippet_count": len(fetched.snippets),
                 "duration_seconds": round(float(last_start) + float(last_duration), 2),
                 "url": f"https://www.youtube.com/watch?v={fetched.video_id}",
+            }
+        )
+
+    @mcp.tool()
+    async def fetch_video_metadata(url_or_id: str) -> str:
+        """Fetch a YouTube video's title and channel.
+
+        Uses YouTube's public oEmbed endpoint, not the transcript scraper, so
+        this is NOT subject to the 5-10 second throttle on ``fetch_transcript``
+        and is safe to call back to back.
+
+        Intended to run before ``format_transcript_as_research``, which needs a
+        title and channel to produce usable frontmatter and cannot look them up
+        itself.
+
+        Args:
+            url_or_id: A YouTube URL (``https://youtu.be/<id>``,
+                ``https://www.youtube.com/watch?v=<id>``, ``/shorts/<id>``,
+                ``/embed/<id>``) or a bare 11-character video ID.
+
+        Returns:
+            Success: ``{"data": {"video_id": str, "title": str, "channel": str,
+                "url": str, "thumbnail_url": str}}``.
+            Failure: ``{"error", "code", "details"}`` with code in
+            ``{INVALID_INPUT, NOT_FOUND, RATE_LIMITED, UPSTREAM_DOWN, INTERNAL}``.
+            ``NOT_FOUND`` covers private, removed, and embedding-disabled videos.
+
+        Example:
+            ``fetch_video_metadata("https://www.youtube.com/watch?v=dQw4w9WgXcQ")``
+        """
+        video_id = parse_video_id(url_or_id)
+        if not video_id:
+            return _err(
+                f"could not parse a YouTube video ID from {url_or_id!r}",
+                "INVALID_INPUT",
+                input=url_or_id,
+            )
+
+        try:
+            meta = await metadata_client.fetch(video_id)
+        except TranscriptError as exc:
+            logger.warning(
+                "fetch_video_metadata failed",
+                extra={"video_id": video_id, "code": exc.code, "reason": str(exc)},
+            )
+            return _err(str(exc), exc.code, video_id=video_id)
+        except Exception as exc:
+            logger.exception("fetch_video_metadata unexpected", extra={"video_id": video_id})
+            return _err(f"unexpected error: {exc}", "INTERNAL", video_id=video_id)
+
+        return _ok(
+            {
+                "video_id": meta.video_id,
+                "title": meta.title,
+                "channel": meta.channel,
+                "url": meta.url,
+                "thumbnail_url": meta.thumbnail_url,
             }
         )
 
