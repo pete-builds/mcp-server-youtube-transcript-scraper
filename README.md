@@ -97,7 +97,8 @@ You can also get the HTTP server without Docker, if you want it under your own
 process manager:
 
 ```bash
-mcp-youtube --transport http        # or: MCP_TRANSPORT=http mcp-youtube
+mcp-youtube --transport http                      # or: MCP_TRANSPORT=http mcp-youtube
+mcp-youtube --transport http --host 127.0.0.1     # loopback only
 ```
 
 ### Check it worked
@@ -140,6 +141,12 @@ Everything here is optional and the defaults are sane, so a local stdio
 install needs no configuration at all. For the Docker deployment, copy
 `.env.example` to `.env` and edit. Full list in `src/mcp_youtube/config.py`.
 
+**`.env` is read only under the `http` transport.** Under stdio your MCP client
+chooses the working directory, and that is your project, not this repo. Reading
+whatever `.env` happened to be sitting there would let an unrelated file
+reconfigure or crash this server, so stdio reads real environment variables
+only. Set them in your client's `env` block if you need them.
+
 | Env var | Default | Purpose |
 |---------|---------|---------|
 | `RATE_LIMIT_MIN_SECONDS` | `5` | Lower bound of random sleep between calls |
@@ -149,8 +156,8 @@ install needs no configuration at all. For the Docker deployment, copy
 | `WEBSHARE_PROXY_USERNAME` | _(unset)_ | Reserved, not yet wired |
 | `WEBSHARE_PROXY_PASSWORD` | _(unset)_ | Reserved, not yet wired |
 | `MCP_TRANSPORT` | `stdio` | `stdio` or `http`. The Docker image sets `http` |
-| `MCP_HOST` | `127.0.0.1` | Bind host, `http` only. The Docker image sets `0.0.0.0` |
-| `MCP_PORT` | `3716` | TCP port, `http` only |
+| `MCP_HOST` | `0.0.0.0` | Bind host, `http` only. Also `--host` |
+| `MCP_PORT` | `3716` | TCP port, `http` only. Also `--port` |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 | `LOG_FORMAT` | `text` under stdio, else `json` | `json` (production) or `text` (dev). Always written to stderr |
 

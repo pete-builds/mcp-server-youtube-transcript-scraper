@@ -2,7 +2,7 @@
 
 Loads values from environment variables (and a ``.env`` file when present),
 validates types/ranges, and prepares optional Webshare proxy support without
-wiring it in v0.1 (env vars are accepted but proxy is not yet plumbed).
+wiring it in yet (env vars are accepted but the proxy is not yet plumbed).
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
-    # Webshare proxy (reserved — NOT wired in v0.1)
+    # Webshare proxy (reserved — NOT wired in yet)
     # ------------------------------------------------------------------
     webshare_proxy_username: str = Field(default="")
     webshare_proxy_password: str = Field(default="")
@@ -76,7 +76,7 @@ class Settings(BaseSettings):
             "MCP_HOST:MCP_PORT and is what the Docker image sets."
         ),
     )
-    mcp_host: str = Field(default="127.0.0.1")
+    mcp_host: str = Field(default="0.0.0.0")
     mcp_port: int = Field(default=3716, ge=1, le=65535)
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(default="INFO")
     log_format: Literal["json", "text"] = Field(default="json")
@@ -113,6 +113,12 @@ class Settings(BaseSettings):
         }
 
 
-def load_settings() -> Settings:
-    """Build a Settings instance from the environment. Raises on invalid config."""
-    return Settings()
+def load_settings(*, env_file: str | None = ".env") -> Settings:
+    """Build a Settings instance from the environment. Raises on invalid config.
+
+    ``env_file=None`` skips dotenv loading entirely. The stdio entrypoint uses
+    that: an MCP client spawns the server with the *user's project* as the
+    working directory, and reading whatever ``.env`` happens to sit there would
+    let an unrelated file reconfigure this server. See ``server.main``.
+    """
+    return Settings(_env_file=env_file)

@@ -257,8 +257,36 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Overrides the MCP_TRANSPORT env var."
         ),
     )
+    parser.add_argument(
+        "--host",
+        default=None,
+        help="Bind address for --transport http. Overrides MCP_HOST (default 0.0.0.0).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Port for --transport http. Overrides MCP_PORT (default 3716).",
+    )
     parser.add_argument("--version", action="version", version=f"mcp-youtube {__version__}")
     return parser.parse_args(argv)
+
+
+def _resolve_transport(args: argparse.Namespace) -> str:
+    """Decide the transport WITHOUT reading a dotenv file.
+
+    This has to run before ``Settings`` is built, because the answer determines
+    whether reading a ``.env`` is safe at all. Precedence is flag, then real
+    environment, then the stdio default.
+    """
+    if args.transport:
+        return str(args.transport)
+    from_env = os.environ.get("MCP_TRANSPORT", "").strip().lower()
+    if from_env in ("stdio", "http"):
+        return from_env
+    if from_env:
+        raise SystemExit(f"MCP_TRANSPORT must be 'stdio' or 'http', got {from_env!r}")
+    return "stdio"
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -270,14 +298,28 @@ def main(argv: list[str] | None = None) -> None:
     long-lived Streamable HTTP server instead.
     """
     args = _parse_args(argv)
-    settings = load_settings()
-    if args.transport:
-        settings.mcp_transport = args.transport
+    transport = _resolve_transport(args)
+
+    # Under stdio the MCP client picks the working directory, and it is the
+    # user's project, not this repo. Reading whatever .env happens to be there
+    # would let an unrelated file crash us (LOG_LEVEL=debug is not a valid
+    # level here) or silently turn us into an HTTP server the client can never
+    # talk to. So stdio reads real environment variables only.
+    settings = load_settings(env_file=None if transport == "stdio" else ".env")
+
+    # Safe without validate_assignment because _resolve_transport only ever
+    # returns a value argparse or the check above already validated.
+    settings.mcp_transport = transport
+    if args.host is not None:
+        settings.mcp_host = args.host
+    if args.port is not None:
+        settings.mcp_port = args.port
 
     # Under stdio a human is usually watching the terminal, so plain text beats
-    # JSON lines. An explicit LOG_FORMAT always wins.
+    # JSON lines. An explicitly configured LOG_FORMAT still wins; model_fields_set
+    # is what reports that, since a dotenv value never reaches os.environ.
     fmt = settings.log_format
-    if settings.mcp_transport == "stdio" and "LOG_FORMAT" not in os.environ:
+    if transport == "stdio" and "log_format" not in settings.model_fields_set:
         fmt = "text"
     configure_logging(level=settings.log_level, fmt=fmt)
 
