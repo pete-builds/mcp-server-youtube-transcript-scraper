@@ -9,7 +9,7 @@ To avoid that:
 - Self-throttle: sleep a random ``[min, max]`` seconds between calls.
 - Surface ``IpBlocked`` / ``RequestBlocked`` distinctly so callers don't
   retry-spam.
-- Reserve the Webshare proxy env vars (not wired in v0.1).
+- Reserve the Webshare proxy env vars (not wired in yet).
 """
 
 from __future__ import annotations
@@ -85,7 +85,7 @@ class YouTubeTranscriptClient:
         self._api: Any | None = None  # lazy import below
         if self._webshare_username and self._webshare_password:
             logger.warning(
-                "webshare proxy env vars set but proxy support is NOT wired in v0.1; "
+                "webshare proxy env vars set but proxy support is NOT wired in yet; "
                 "fetches will use the server's direct IP",
                 extra={"webshare_proxy_user": self._webshare_username[:2] + "***"},
             )

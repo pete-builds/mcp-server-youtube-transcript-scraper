@@ -3,16 +3,22 @@
 Two tools, single-user, stateless. Self-throttles to keep YouTube from
 banning the server's IP (1 request per 5-10 seconds with random jitter).
 
-Transport: Streamable HTTP via FastMCP (current MCP spec).
+Transport: stdio by default (local, client-spawned); Streamable HTTP when
+MCP_TRANSPORT=http, which is what the Docker image sets.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
+import os
+from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
+from pydantic import ValidationError
+from pydantic_settings import SettingsError
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -235,15 +241,190 @@ def build_server(
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
-    """CLI entrypoint used by the Docker image."""
-    settings = load_settings()
-    configure_logging(level=settings.log_level, fmt=settings.log_format)
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse the CLI flags. Everything here also has an env var equivalent."""
+    parser = argparse.ArgumentParser(
+        prog="mcp-youtube",
+        description=(
+            "MCP server that fetches YouTube transcripts and shapes them as "
+            "research-ready markdown."
+        ),
+    )
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "http"],
+        default=None,
+        help=(
+            "stdio (default): the MCP client spawns this process and talks over "
+            "stdin/stdout. http: serve Streamable HTTP on MCP_HOST:MCP_PORT. "
+            "Overrides the MCP_TRANSPORT env var."
+        ),
+    )
+    parser.add_argument(
+        "--host",
+        default=None,
+        help="Bind address for --transport http. Overrides MCP_HOST (default 0.0.0.0).",
+    )
+    parser.add_argument(
+        "--port",
+        type=_port_number,
+        default=None,
+        help="Port for --transport http. Overrides MCP_PORT (default 3716).",
+    )
+    parser.add_argument("--version", action="version", version=f"mcp-youtube {__version__}")
+    return parser.parse_args(argv)
+
+
+def _port_number(value: str) -> int:
+    """argparse type for --port, matching the ge=1/le=65535 on the settings field."""
+    try:
+        port = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"port must be a whole number, got {value!r}") from None
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError(f"port must be between 1 and 65535, got {port}")
+    return port
+
+
+#: Prefixes and names this server actually reads. A project .env is only worth
+#: mentioning if it sets one of these; most .env files are about something else
+#: entirely, and warning about those would make the stdio path noisy for everyone.
+_RECOGNISED_ENV = (
+    "MCP_",
+    "LOG_",
+    "RATE_LIMIT_",
+    "WEBSHARE_",
+    "DEFAULT_LANGUAGE",
+    "FALLBACK_LANGUAGES",
+)
+
+
+def _recognised_dotenv_keys(path: Path) -> list[str]:
+    """Return the settings keys in ``path`` that this server would have honoured.
+
+    Best effort and never fatal: an unreadable or malformed .env just means we
+    stay quiet, because this only drives a warning message.
+    """
+    try:
+        # utf-8-sig, because a BOM would otherwise become part of the first key.
+        lines = path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+    except OSError:
+        return []
+    found = []
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key = line.split("=", 1)[0].strip()
+        # python-dotenv's binding is `(?:export\s+)?`, so any whitespace counts,
+        # not just a space.
+        parts = key.split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == "export":
+            key = parts[1]
+        key = key.upper()
+        if key.startswith(_RECOGNISED_ENV) and key not in found:
+            found.append(key)
+    return found
+
+
+def _resolve_transport(args: argparse.Namespace) -> str:
+    """Decide the transport WITHOUT reading a dotenv file.
+
+    This has to run before ``Settings`` is built, because the answer determines
+    whether reading a ``.env`` is safe at all. Precedence is flag, then real
+    environment, then the stdio default.
+
+    Accepts what ``Settings`` would reject (``HTTP``, ``" http "``, and the
+    empty string a bare ``MCP_TRANSPORT=`` line or a compose ``MCP_TRANSPORT: ""``
+    produces) so the caller can canonicalise it. Anything that is not a
+    near-miss gets a one-line message rather than a pydantic traceback.
+    """
+    if args.transport:
+        return str(args.transport)
+    raw = os.environ.get("MCP_TRANSPORT", "")
+    normalized = raw.strip().lower()
+    if not normalized:
+        return "stdio"
+    if normalized not in ("stdio", "http"):
+        raise SystemExit(f"MCP_TRANSPORT must be 'stdio' or 'http', got {raw!r}")
+    return normalized
+
+
+def main(argv: list[str] | None = None) -> None:
+    """CLI entrypoint for both transports.
+
+    Defaults to stdio so that ``uvx mcp-youtube`` (or any MCP client spawning
+    this command) just works with nothing to install and no port to keep
+    listening. The Docker image sets ``MCP_TRANSPORT=http`` to get the
+    long-lived Streamable HTTP server instead.
+    """
+    args = _parse_args(argv)
+    transport = _resolve_transport(args)
+
+    # Under stdio the MCP client picks the working directory, and it is the
+    # user's project, not this repo. Reading whatever .env happens to be there
+    # would let an unrelated file crash us (LOG_LEVEL=debug is not a valid
+    # level here) or silently turn us into an HTTP server the client can never
+    # talk to. So stdio reads real environment variables only.
+    # Overrides go through pydantic rather than being assigned onto the model,
+    # because validate_assignment is off: a direct `settings.mcp_port = 70000`
+    # would stick and then fail deep inside uvicorn instead of here.
+    #
+    # mcp_transport is passed the same way to canonicalise it. _resolve_transport
+    # deliberately accepts near-misses the strict Literal on the field would
+    # reject ("HTTP", " http ", ""), and an init kwarg outranks the environment,
+    # so this keeps the process off a pydantic traceback below without writing
+    # anything back into os.environ, which would leak into later main() calls,
+    # the rest of a test session, and every child process.
+    overrides: dict[str, object] = {"mcp_transport": transport}
+    if args.host is not None:
+        overrides["mcp_host"] = args.host
+    if args.port is not None:
+        overrides["mcp_port"] = args.port
+
+    try:
+        settings = load_settings(
+            env_file=None if transport == "stdio" else ".env",
+            **overrides,
+        )
+    except (ValidationError, SettingsError, OSError) as exc:
+        raise SystemExit(f"invalid configuration:\n{exc}") from exc
+
+    # Under stdio a human is usually watching the terminal, so plain text beats
+    # JSON lines. An explicitly configured LOG_FORMAT still wins; model_fields_set
+    # is what reports that, since a dotenv value never reaches os.environ.
+    fmt = settings.log_format
+    if transport == "stdio" and "log_format" not in settings.model_fields_set:
+        fmt = "text"
+    configure_logging(level=settings.log_level, fmt=fmt)
+
+    if transport == "stdio":
+        ignored = _recognised_dotenv_keys(Path(".env"))
+        if ignored:
+            logger.warning(
+                "ignoring %s in %s: the stdio transport reads real environment "
+                "variables only. Set them in your MCP client's env block.",
+                ", ".join(ignored),
+                Path.cwd(),
+            )
+        if args.host is not None or args.port is not None:
+            logger.warning("--host and --port do nothing under the stdio transport")
+
     logger.info(
         "MCP YouTube starting",
-        extra={"version": __version__, "config": settings.safe_repr()},
+        # log_format from safe_repr() is the configured value, which is not the
+        # one in force when stdio defaults it to text.
+        extra={"version": __version__, "config": {**settings.safe_repr(), "log_format": fmt}},
     )
     server = build_server(settings)
+
+    if transport == "stdio":
+        # No host/port: the client owns the process lifetime. The banner is
+        # suppressed because FastMCP has written it to stdout in some versions,
+        # and on this transport stdout is the wire.
+        server.run(transport="stdio", show_banner=False)
+        return
+
     server.run(
         transport="streamable-http",
         host=settings.mcp_host,
