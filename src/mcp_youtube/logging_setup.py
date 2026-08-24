@@ -64,19 +64,31 @@ def _scrub(value: Any) -> Any:
 
 
 def _collect_extras(record: logging.LogRecord) -> dict[str, Any]:
-    """Return the record's ``extra`` payload, scrubbed.
+    """Return the record's ``extra`` payload, scrubbed, and never raise.
 
-    Passes the whole mapping through ``_scrub`` rather than scrubbing only the
-    values, so a sensitive name used as a top-level extra key (``extra={
-    "webshare_proxy_password": ...}``) is redacted like a nested one.
+    Scrubs the top-level key as well as the value, so a sensitive name used
+    directly as an extra key (``extra={"webshare_proxy_password": ...}``) is
+    redacted like a nested one.
+
+    Every value is scrubbed under its own guard. A formatter that throws costs
+    you the log record, and for ``RecursionError`` it costs you the caller too:
+    ``StreamHandler.emit`` re-raises that one instead of routing it to
+    ``handleError``. Isolating each key also means one awkward value cannot take
+    the rest of the line with it, which matters when the salvageable half is the
+    identifier you need to debug the failure.
     """
-    return _scrub(
-        {
-            key: value
-            for key, value in record.__dict__.items()
-            if key not in _RESERVED_LOGRECORD_FIELDS and not key.startswith("_")
-        }
-    )
+    extras: dict[str, Any] = {}
+    for key, value in record.__dict__.items():
+        if key in _RESERVED_LOGRECORD_FIELDS or key.startswith("_"):
+            continue
+        if key.lower() in _SENSITIVE_KEYS:
+            extras[key] = "[REDACTED]"
+            continue
+        try:
+            extras[key] = _scrub(value)
+        except Exception:
+            extras[key] = f"<unrenderable {type(value).__name__}>"
+    return extras
 
 
 class JsonFormatter(logging.Formatter):
@@ -94,7 +106,11 @@ class JsonFormatter(logging.Formatter):
         extras = _collect_extras(record)
         if extras:
             payload["extra"] = extras
-        return json.dumps(payload, default=str)
+        try:
+            return json.dumps(payload, default=str)
+        except Exception:
+            payload["extra"] = {"error": "extras could not be serialised"}
+            return json.dumps(payload, default=str)
 
 
 class TextFormatter(logging.Formatter):
@@ -134,22 +150,15 @@ class TextFormatter(logging.Formatter):
 
     @staticmethod
     def _render_extras(record: logging.LogRecord) -> str:
-        """Render the extras, and never raise while doing it.
-
-        A formatter that throws loses the record and, for a RecursionError,
-        escapes logging's own error handling into the caller. Diagnostics are
-        not worth that, so anything awkward degrades to a repr.
-        """
-        try:
-            extras = _collect_extras(record)
-            if not extras:
-                return ""
-            return " ".join(f"{k}={json.dumps(v, default=str)}" for k, v in extras.items())
-        except Exception:
+        """Render the extras one key at a time, degrading only the bad ones."""
+        parts = []
+        for key, value in _collect_extras(record).items():
             try:
-                return f"<unrenderable extra: {type(record.__dict__).__name__}>"
+                rendered = json.dumps(value, default=str)
             except Exception:
-                return "<unrenderable extra>"
+                rendered = f'"<unrenderable {type(value).__name__}>"'
+            parts.append(f"{key}={rendered}")
+        return " ".join(parts)
 
 
 def configure_logging(level: str = "INFO", fmt: str = "json") -> None:

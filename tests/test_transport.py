@@ -502,7 +502,103 @@ def test_recognised_dotenv_keys_handles_real_dotenv_forms(
     assert _recognised_dotenv_keys(path) == expected
 
 
-def test_startup_log_reports_the_format_actually_in_use(run_main, isolated_env) -> None:
-    """stdio defaults the format to text while the settings field still says json."""
-    captured = run_main([])
-    assert captured["log_fmt"] == "text"
+def test_startup_log_reports_the_format_actually_in_use(
+    isolated_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """stdio defaults the format to text while the settings field still says json.
+
+    Inspects the emitted startup record rather than the value handed to
+    configure_logging: stubbing the logger, as the other main() tests do, leaves
+    this hunk untested, because the record is never rendered.
+    """
+    err = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", err)
+    monkeypatch.setattr(server_module, "build_server", lambda settings: _NeverRuns())
+
+    with pytest.raises(AssertionError):  # _NeverRuns fires instead of serving
+        server_module.main([])
+
+    startup = [ln for ln in err.getvalue().splitlines() if "MCP YouTube starting" in ln]
+    assert startup, err.getvalue()
+    assert '"log_format": "text"' in startup[0]
+    assert '"log_format": "json"' not in startup[0]
+
+
+# ---------------------------------------------------------------------------
+# JSON formatter safety
+#
+# json is the default format, and only stdio flips it to text, so the container
+# deployment runs entirely on this path. The safety work landed on the text
+# formatter first and left this one unguarded.
+# ---------------------------------------------------------------------------
+
+
+def _json_log(monkeypatch: pytest.MonkeyPatch, message: str, **kwargs) -> str:
+    err = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", err)
+    configure_logging(level="INFO", fmt="json")
+    logging.getLogger("mcp_youtube.test").info(message, **kwargs)
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+    return err.getvalue()
+
+
+def test_json_formatter_survives_a_self_referential_extra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """StreamHandler.emit re-raises RecursionError instead of handling it."""
+    loop: dict = {}
+    loop["self"] = loop
+    assert "cyclic" in _json_log(monkeypatch, "cyclic", extra={"payload": loop})
+
+
+def test_json_formatter_survives_an_unserialisable_extra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert "odd" in _json_log(monkeypatch, "odd", extra={"payload": {1: "a", (2, 3): "b"}})
+
+
+@pytest.mark.parametrize("fmt", ["json", "text"])
+def test_one_bad_extra_does_not_discard_the_good_ones(
+    fmt: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The salvageable half is usually the identifier you need to debug the failure."""
+    loop: dict = {}
+    loop["self"] = loop
+    err = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", err)
+    configure_logging(level="INFO", fmt=fmt)
+    logging.getLogger("mcp_youtube.test").info(
+        "partial", extra={"video_id": "abc", "payload": loop}
+    )
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+    out = err.getvalue()
+    assert "abc" in out
+    assert "unrenderable" in out
+
+
+@pytest.mark.parametrize("fmt", ["json", "text"])
+def test_secrets_are_scrubbed_in_both_formats(fmt: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    err = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", err)
+    configure_logging(level="INFO", fmt=fmt)
+    logging.getLogger("mcp_youtube.test").info(
+        "cfg",
+        extra={
+            "webshare_proxy_password": "top-level",
+            "config": {"webshare_proxy_password": "nested"},
+        },
+    )
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+    out = err.getvalue()
+    assert "top-level" not in out
+    assert "nested" not in out
+
+
+def test_recognised_dotenv_keys_handles_tab_after_export(isolated_env) -> None:
+    """python-dotenv's binding is `(?:export\\s+)?`, so a tab counts too."""
+    path = isolated_env / ".env"
+    path.write_bytes(b"export\tMCP_PORT=9999\n")
+    assert _recognised_dotenv_keys(path) == ["MCP_PORT"]

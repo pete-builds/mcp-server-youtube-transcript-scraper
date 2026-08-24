@@ -316,8 +316,11 @@ def _recognised_dotenv_keys(path: Path) -> list[str]:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key = line.split("=", 1)[0].strip()
-        if key.lower().startswith("export "):  # python-dotenv honours this form
-            key = key[len("export ") :].strip()
+        # python-dotenv's binding is `(?:export\s+)?`, so any whitespace counts,
+        # not just a space.
+        parts = key.split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == "export":
+            key = parts[1]
         key = key.upper()
         if key.startswith(_RECOGNISED_ENV) and key not in found:
             found.append(key)
