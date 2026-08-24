@@ -306,6 +306,13 @@ def test_port_flag_is_range_checked() -> None:
             _parse_args(["--port", bad])
 
 
+class _NeverRuns:
+    """Stand-in server whose run() fails loudly instead of binding a port."""
+
+    def run(self, **kwargs):
+        raise AssertionError(f"server should not have started: {kwargs}")
+
+
 # ---------------------------------------------------------------------------
 # Process-environment hygiene
 # ---------------------------------------------------------------------------
@@ -370,6 +377,11 @@ def test_main_survives_an_unreadable_dotenv_on_http(isolated_env, monkeypatch) -
     if os.access(env_path, os.R_OK):  # running as root: the chmod means nothing
         pytest.skip("cannot make a file unreadable as this user")
 
+    # os.access is not a reliable predictor of open(): with CAP_DAC_READ_SEARCH
+    # the read succeeds, main() falls through to a real server, and an
+    # unstubbed run would bind 3716 and block the suite forever.
+    monkeypatch.setattr(server_module, "build_server", lambda settings: _NeverRuns())
+
     with pytest.raises(SystemExit) as exc:
         server_module.main(["--transport", "http"])
     assert "invalid configuration" in str(exc.value)
@@ -398,3 +410,99 @@ def test_text_formatter_still_scrubs_secrets(monkeypatch: pytest.MonkeyPatch) ->
     out = err.getvalue()
     assert "hunter2" not in out
     assert "REDACTED" in out
+
+
+# ---------------------------------------------------------------------------
+# Text formatter safety
+#
+# Text became the default format under stdio, so this formatter now runs on the
+# path most users are on. Everything below is a regression it introduced once.
+# ---------------------------------------------------------------------------
+
+
+def _text_log(monkeypatch: pytest.MonkeyPatch, message: str, **kwargs) -> str:
+    err = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", err)
+    configure_logging(level="INFO", fmt="text")
+    log = logging.getLogger("mcp_youtube.test")
+    if kwargs.pop("as_exception", False):
+        try:
+            raise ZeroDivisionError("boom")
+        except ZeroDivisionError:
+            log.exception(message, **kwargs)
+    else:
+        log.info(message, **kwargs)
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+    return err.getvalue()
+
+
+def test_text_formatter_scrubs_a_top_level_extra_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A secret named directly as the extra key, not nested inside a dict."""
+    out = _text_log(monkeypatch, "cfg", extra={"webshare_proxy_password": "hunter2"})
+    assert "hunter2" not in out
+    assert "REDACTED" in out
+
+
+def test_json_formatter_scrubs_a_top_level_extra_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    err = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", err)
+    configure_logging(level="INFO", fmt="json")
+    logging.getLogger("mcp_youtube.test").info("cfg", extra={"webshare_proxy_password": "hunter2"})
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+    assert "hunter2" not in err.getvalue()
+
+
+def test_text_formatter_puts_extras_before_the_traceback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Appending after super().format() glued them onto the last traceback line."""
+    out = _text_log(monkeypatch, "failed", extra={"video_id": "abc"}, as_exception=True)
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    assert 'video_id="abc"' in lines[0]
+    assert "ZeroDivisionError" in lines[-1]
+    assert "video_id" not in lines[-1]
+
+
+def test_text_formatter_survives_an_unserialisable_extra(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-string dict key made _scrub raise inside emit and dropped the record."""
+    out = _text_log(monkeypatch, "odd", extra={"payload": {1: "a", (2, 3): "b"}})
+    assert "odd" in out
+
+
+def test_text_formatter_survives_a_self_referential_extra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RecursionError used to escape logging's handler and reach the caller."""
+    loop: dict = {}
+    loop["self"] = loop
+    out = _text_log(monkeypatch, "cyclic", extra={"payload": loop})
+    assert "cyclic" in out
+
+
+# ---------------------------------------------------------------------------
+# dotenv key detection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("contents", "expected"),
+    [
+        ("export MCP_PORT=9999\n", ["MCP_PORT"]),
+        ("﻿MCP_PORT=9999\n", ["MCP_PORT"]),
+        ("export  LOG_LEVEL=INFO\n", ["LOG_LEVEL"]),
+        ("MCP_PORT=1\nMCP_PORT=2\n", ["MCP_PORT"]),
+    ],
+)
+def test_recognised_dotenv_keys_handles_real_dotenv_forms(
+    isolated_env, contents: str, expected: list[str]
+) -> None:
+    """python-dotenv honours `export KEY=` and a BOM; a silent miss under-warns."""
+    path = isolated_env / ".env"
+    path.write_bytes(contents.encode("utf-8"))
+    assert _recognised_dotenv_keys(path) == expected
+
+
+def test_startup_log_reports_the_format_actually_in_use(run_main, isolated_env) -> None:
+    """stdio defaults the format to text while the settings field still says json."""
+    captured = run_main([])
+    assert captured["log_fmt"] == "text"

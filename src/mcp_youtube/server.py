@@ -306,15 +306,19 @@ def _recognised_dotenv_keys(path: Path) -> list[str]:
     stay quiet, because this only drives a warning message.
     """
     try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        # utf-8-sig, because a BOM would otherwise become part of the first key.
+        lines = path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
     except OSError:
         return []
     found = []
-    for line in lines:
-        line = line.strip()
+    for raw in lines:
+        line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
-        key = line.split("=", 1)[0].strip().upper()
+        key = line.split("=", 1)[0].strip()
+        if key.lower().startswith("export "):  # python-dotenv honours this form
+            key = key[len("export ") :].strip()
+        key = key.upper()
         if key.startswith(_RECOGNISED_ENV) and key not in found:
             found.append(key)
     return found
@@ -405,7 +409,9 @@ def main(argv: list[str] | None = None) -> None:
 
     logger.info(
         "MCP YouTube starting",
-        extra={"version": __version__, "config": settings.safe_repr()},
+        # log_format from safe_repr() is the configured value, which is not the
+        # one in force when stdio defaults it to text.
+        extra={"version": __version__, "config": {**settings.safe_repr(), "log_format": fmt}},
     )
     server = build_server(settings)
 

@@ -63,6 +63,22 @@ def _scrub(value: Any) -> Any:
     return value
 
 
+def _collect_extras(record: logging.LogRecord) -> dict[str, Any]:
+    """Return the record's ``extra`` payload, scrubbed.
+
+    Passes the whole mapping through ``_scrub`` rather than scrubbing only the
+    values, so a sensitive name used as a top-level extra key (``extra={
+    "webshare_proxy_password": ...}``) is redacted like a nested one.
+    """
+    return _scrub(
+        {
+            key: value
+            for key, value in record.__dict__.items()
+            if key not in _RESERVED_LOGRECORD_FIELDS and not key.startswith("_")
+        }
+    )
+
+
 class JsonFormatter(logging.Formatter):
     """Serialise each log record as a single JSON line."""
 
@@ -75,11 +91,7 @@ class JsonFormatter(logging.Formatter):
         }
         if record.exc_info:
             payload["exc_info"] = self.formatException(record.exc_info)
-        extras = {
-            key: _scrub(value)
-            for key, value in record.__dict__.items()
-            if key not in _RESERVED_LOGRECORD_FIELDS and not key.startswith("_")
-        }
+        extras = _collect_extras(record)
         if extras:
             payload["extra"] = extras
         return json.dumps(payload, default=str)
@@ -101,15 +113,43 @@ class TextFormatter(logging.Formatter):
         )
 
     def format(self, record: logging.LogRecord) -> str:
-        line = super().format(record)
-        extras = {
-            key: _scrub(value)
-            for key, value in record.__dict__.items()
-            if key not in _RESERVED_LOGRECORD_FIELDS and not key.startswith("_")
-        }
-        if extras:
-            line += " " + " ".join(f"{k}={json.dumps(v, default=str)}" for k, v in extras.items())
+        record.message = record.getMessage()
+        if self.usesTime():
+            record.asctime = self.formatTime(record, self.datefmt)
+        line = self.formatMessage(record)
+
+        # Before the traceback, not after: the stock format() appends exception
+        # text first, which would glue these onto the last line of the stack.
+        rendered = self._render_extras(record)
+        if rendered:
+            line += " " + rendered
+
+        if record.exc_info and not record.exc_text:
+            record.exc_text = self.formatException(record.exc_info)
+        if record.exc_text:
+            line += "\n" + record.exc_text
+        if record.stack_info:
+            line += "\n" + self.formatStack(record.stack_info)
         return line
+
+    @staticmethod
+    def _render_extras(record: logging.LogRecord) -> str:
+        """Render the extras, and never raise while doing it.
+
+        A formatter that throws loses the record and, for a RecursionError,
+        escapes logging's own error handling into the caller. Diagnostics are
+        not worth that, so anything awkward degrades to a repr.
+        """
+        try:
+            extras = _collect_extras(record)
+            if not extras:
+                return ""
+            return " ".join(f"{k}={json.dumps(v, default=str)}" for k, v in extras.items())
+        except Exception:
+            try:
+                return f"<unrenderable extra: {type(record.__dict__).__name__}>"
+            except Exception:
+                return "<unrenderable extra>"
 
 
 def configure_logging(level: str = "INFO", fmt: str = "json") -> None:
