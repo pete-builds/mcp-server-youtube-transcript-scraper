@@ -85,6 +85,33 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, default=str)
 
 
+class TextFormatter(logging.Formatter):
+    """Human-readable single line, including the ``extra`` payload.
+
+    The stock formatter renders only ``%(message)s``, which silently drops every
+    ``extra`` dict. Since text is the default under the stdio transport, that
+    would make the startup line read ``MCP YouTube starting`` with no version,
+    transport, or port anywhere.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            fmt="%(asctime)s %(levelname)s %(name)s: %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%S%z",
+        )
+
+    def format(self, record: logging.LogRecord) -> str:
+        line = super().format(record)
+        extras = {
+            key: _scrub(value)
+            for key, value in record.__dict__.items()
+            if key not in _RESERVED_LOGRECORD_FIELDS and not key.startswith("_")
+        }
+        if extras:
+            line += " " + " ".join(f"{k}={json.dumps(v, default=str)}" for k, v in extras.items())
+        return line
+
+
 def configure_logging(level: str = "INFO", fmt: str = "json") -> None:
     """Configure the root logger. Idempotent — safe to call multiple times."""
     root = logging.getLogger()
@@ -97,15 +124,7 @@ def configure_logging(level: str = "INFO", fmt: str = "json") -> None:
     # client drops the connection. Docker captures stderr the same as stdout,
     # so the HTTP/container path loses nothing by this.
     handler = logging.StreamHandler(stream=sys.stderr)
-    if fmt == "json":
-        handler.setFormatter(JsonFormatter())
-    else:
-        handler.setFormatter(
-            logging.Formatter(
-                fmt="%(asctime)s %(levelname)s %(name)s: %(message)s",
-                datefmt="%Y-%m-%dT%H:%M:%S%z",
-            )
-        )
+    handler.setFormatter(JsonFormatter() if fmt == "json" else TextFormatter())
     root.addHandler(handler)
 
     # Silence the urllib/requests INFO chatter that youtube-transcript-api

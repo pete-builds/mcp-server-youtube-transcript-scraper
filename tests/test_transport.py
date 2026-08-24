@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 import sys
 
 import pytest
@@ -17,35 +18,19 @@ import pytest
 from mcp_youtube import server as server_module
 from mcp_youtube.config import Settings, load_settings
 from mcp_youtube.logging_setup import configure_logging
-from mcp_youtube.server import _parse_args, _resolve_transport
-
-#: Every setting this module asserts a default for. Exported in a developer's
-#: shell, any one of them turns a green suite red for reasons unrelated to the
-#: change under test.
-_SETTING_VARS = (
-    "MCP_TRANSPORT",
-    "MCP_HOST",
-    "MCP_PORT",
-    "LOG_LEVEL",
-    "LOG_FORMAT",
-    "DEFAULT_LANGUAGE",
-    "FALLBACK_LANGUAGES",
-    "RATE_LIMIT_MIN_SECONDS",
-    "RATE_LIMIT_MAX_SECONDS",
-)
+from mcp_youtube.server import _parse_args, _recognised_dotenv_keys, _resolve_transport
 
 
 @pytest.fixture
 def isolated_env(monkeypatch: pytest.MonkeyPatch, tmp_path):
-    """Neutralise BOTH config sources: the ambient dotenv and the real environment.
+    """Move to an empty directory so no ambient .env is in reach.
 
-    A developer who followed the README's Docker instructions has a .env in the
-    repo root, and one who is debugging has MCP_TRANSPORT exported. Either used
-    to fail these assertions locally while CI stayed green.
+    The real environment is already stripped for every test by the autouse
+    fixture in conftest.py; this adds the other config source. A developer who
+    followed the README's Docker instructions has a .env in the repo root, which
+    used to fail these default assertions locally while CI stayed green.
     """
     monkeypatch.chdir(tmp_path)
-    for name in _SETTING_VARS:
-        monkeypatch.delenv(name, raising=False)
     return tmp_path
 
 
@@ -75,12 +60,12 @@ def test_host_default_is_unchanged_from_0_1(clean_settings) -> None:
     assert clean_settings().mcp_host == "0.0.0.0"
 
 
-def test_transport_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_transport_reads_env(isolated_env, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MCP_TRANSPORT", "http")
     assert Settings(_env_file=None).mcp_transport == "http"
 
 
-def test_transport_rejects_unknown_value(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_transport_rejects_unknown_value(isolated_env, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MCP_TRANSPORT", "carrier-pigeon")
     with pytest.raises(ValueError):
         Settings(_env_file=None)
@@ -235,12 +220,17 @@ def test_main_defaults_stdio_logs_to_text(run_main, isolated_env) -> None:
 
 
 def test_main_honours_explicit_log_format_from_dotenv(run_main, isolated_env) -> None:
-    """The regression guard for the os.environ-vs-dotenv bug.
+    """A dotenv LOG_FORMAT must reach the formatter on the http path.
 
-    A dotenv value never reaches os.environ, so checking os.environ here would
-    silently override a LOG_FORMAT the user configured on purpose.
+    Asserts ``text``, not the ``json`` default: asserting the default would pass
+    whether or not the dotenv was read at all.
     """
-    (isolated_env / ".env").write_text("LOG_FORMAT=json\n")
+    (isolated_env / ".env").write_text("LOG_FORMAT=text\n")
+    assert run_main(["--transport", "http"])["log_fmt"] == "text"
+
+
+def test_main_dotenv_log_format_is_actually_read(run_main, isolated_env) -> None:
+    """Control for the test above: without the dotenv the same call yields json."""
     assert run_main(["--transport", "http"])["log_fmt"] == "json"
 
 
@@ -253,7 +243,11 @@ def test_main_honours_explicit_log_format_from_environ(
 
 def test_main_passes_cli_overrides_through_pydantic(run_main, isolated_env) -> None:
     captured = run_main(["--transport", "http", "--host", "127.0.0.1", "--port", "9999"])
-    assert captured["overrides"] == {"mcp_host": "127.0.0.1", "mcp_port": 9999}
+    assert captured["overrides"] == {
+        "mcp_transport": "http",
+        "mcp_host": "127.0.0.1",
+        "mcp_port": 9999,
+    }
     assert captured["run_kwargs"]["host"] == "127.0.0.1"
     assert captured["run_kwargs"]["port"] == 9999
 
@@ -310,3 +304,97 @@ def test_port_flag_is_range_checked() -> None:
     for bad in ["70000", "0", "-1", "notanumber"]:
         with pytest.raises(SystemExit):
             _parse_args(["--port", bad])
+
+
+# ---------------------------------------------------------------------------
+# Process-environment hygiene
+# ---------------------------------------------------------------------------
+
+
+def test_main_does_not_mutate_the_process_environment(run_main, isolated_env) -> None:
+    """An earlier fix canonicalised the transport by writing it into os.environ.
+
+    That leaked: a later main() in the same process (and the rest of a test
+    session, and every child process) inherited it, so `main([])` with no flag
+    and no user-set variable started an HTTP server.
+    """
+    run_main(["--transport", "http"])
+    assert "MCP_TRANSPORT" not in os.environ
+
+
+def test_main_is_not_influenced_by_a_previous_call(run_main, isolated_env) -> None:
+    run_main(["--transport", "http"])
+    assert run_main([])["run_kwargs"]["transport"] == "stdio"
+
+
+@pytest.mark.parametrize(
+    ("contents", "expected"),
+    [
+        ("DATABASE_URL=postgres://x\nSTRIPE_KEY=sk_test\n", False),
+        ("", False),
+        ("# MCP_PORT=1\n", False),
+        ("MCP_PORT=9999\n", True),
+        ("log_level=DEBUG\n", True),
+        ("RATE_LIMIT_MIN_SECONDS=1\n", True),
+    ],
+)
+def test_dotenv_warning_only_fires_for_settings_we_recognise(
+    isolated_env, contents: str, expected: bool
+) -> None:
+    """Under stdio the cwd is the user's project, and most .env files are unrelated.
+
+    Warning about every one of them would make the default path noisy for
+    everybody, so only a file that actually sets something we would have used
+    is worth a line.
+    """
+    env_path = isolated_env / ".env"
+    env_path.write_text(contents)
+    assert bool(_recognised_dotenv_keys(env_path)) is expected
+
+
+def test_recognised_dotenv_keys_survives_an_unreadable_file(isolated_env) -> None:
+    """This only drives a warning, so it must never be the thing that fails."""
+    assert _recognised_dotenv_keys(isolated_env / "does-not-exist.env") == []
+
+
+def test_main_survives_an_unreadable_dotenv_on_http(isolated_env, monkeypatch) -> None:
+    """dotenv raises OSError here, which is neither ValidationError nor SettingsError.
+
+    Covers main() only. The installed console script can still fail earlier and
+    outside our control: fastmcp instantiates its own pydantic-settings object at
+    import time, which reads the same .env before main() is reachable.
+    """
+    env_path = isolated_env / ".env"
+    env_path.write_text("MCP_PORT=3716\n")
+    env_path.chmod(0o000)
+    if os.access(env_path, os.R_OK):  # running as root: the chmod means nothing
+        pytest.skip("cannot make a file unreadable as this user")
+
+    with pytest.raises(SystemExit) as exc:
+        server_module.main(["--transport", "http"])
+    assert "invalid configuration" in str(exc.value)
+
+
+def test_text_formatter_renders_extras(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Text is the default under stdio; dropping extras would hide the whole config."""
+    err = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", err)
+    configure_logging(level="INFO", fmt="text")
+    logging.getLogger("mcp_youtube.test").info("starting", extra={"version": "9.9.9"})
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+    assert "9.9.9" in err.getvalue()
+
+
+def test_text_formatter_still_scrubs_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
+    err = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", err)
+    configure_logging(level="INFO", fmt="text")
+    logging.getLogger("mcp_youtube.test").info(
+        "cfg", extra={"config": {"webshare_proxy_password": "hunter2"}}
+    )
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+    out = err.getvalue()
+    assert "hunter2" not in out
+    assert "REDACTED" in out

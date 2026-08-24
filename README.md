@@ -147,6 +147,10 @@ whatever `.env` happened to be sitting there would let an unrelated file
 reconfigure or crash this server, so stdio reads real environment variables
 only. Set them in your client's `env` block if you need them.
 
+This covers every setting in the table below. It does not cover FastMCP's own
+`FASTMCP_*` settings, which that library reads from the working directory when
+it is imported, before this server gets control.
+
 | Env var | Default | Purpose |
 |---------|---------|---------|
 | `RATE_LIMIT_MIN_SECONDS` | `5` | Lower bound of random sleep between calls |

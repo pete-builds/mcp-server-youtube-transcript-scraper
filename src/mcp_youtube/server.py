@@ -18,6 +18,7 @@ from typing import Any
 
 from fastmcp import FastMCP
 from pydantic import ValidationError
+from pydantic_settings import SettingsError
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -285,6 +286,40 @@ def _port_number(value: str) -> int:
     return port
 
 
+#: Prefixes and names this server actually reads. A project .env is only worth
+#: mentioning if it sets one of these; most .env files are about something else
+#: entirely, and warning about those would make the stdio path noisy for everyone.
+_RECOGNISED_ENV = (
+    "MCP_",
+    "LOG_",
+    "RATE_LIMIT_",
+    "WEBSHARE_",
+    "DEFAULT_LANGUAGE",
+    "FALLBACK_LANGUAGES",
+)
+
+
+def _recognised_dotenv_keys(path: Path) -> list[str]:
+    """Return the settings keys in ``path`` that this server would have honoured.
+
+    Best effort and never fatal: an unreadable or malformed .env just means we
+    stay quiet, because this only drives a warning message.
+    """
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    found = []
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key = line.split("=", 1)[0].strip().upper()
+        if key.startswith(_RECOGNISED_ENV) and key not in found:
+            found.append(key)
+    return found
+
+
 def _resolve_transport(args: argparse.Namespace) -> str:
     """Decide the transport WITHOUT reading a dotenv file.
 
@@ -324,16 +359,17 @@ def main(argv: list[str] | None = None) -> None:
     # would let an unrelated file crash us (LOG_LEVEL=debug is not a valid
     # level here) or silently turn us into an HTTP server the client can never
     # talk to. So stdio reads real environment variables only.
-    # Canonicalise before Settings reads it. _resolve_transport deliberately
-    # accepts near-misses that the strict Literal on the field would reject, and
-    # without this the process dies on a pydantic traceback one line below,
-    # before logging is configured and with nothing actionable on stderr.
-    os.environ["MCP_TRANSPORT"] = transport
-
     # Overrides go through pydantic rather than being assigned onto the model,
     # because validate_assignment is off: a direct `settings.mcp_port = 70000`
     # would stick and then fail deep inside uvicorn instead of here.
-    overrides: dict[str, object] = {}
+    #
+    # mcp_transport is passed the same way to canonicalise it. _resolve_transport
+    # deliberately accepts near-misses the strict Literal on the field would
+    # reject ("HTTP", " http ", ""), and an init kwarg outranks the environment,
+    # so this keeps the process off a pydantic traceback below without writing
+    # anything back into os.environ, which would leak into later main() calls,
+    # the rest of a test session, and every child process.
+    overrides: dict[str, object] = {"mcp_transport": transport}
     if args.host is not None:
         overrides["mcp_host"] = args.host
     if args.port is not None:
@@ -344,7 +380,7 @@ def main(argv: list[str] | None = None) -> None:
             env_file=None if transport == "stdio" else ".env",
             **overrides,
         )
-    except ValidationError as exc:
+    except (ValidationError, SettingsError, OSError) as exc:
         raise SystemExit(f"invalid configuration:\n{exc}") from exc
 
     # Under stdio a human is usually watching the terminal, so plain text beats
@@ -355,12 +391,17 @@ def main(argv: list[str] | None = None) -> None:
         fmt = "text"
     configure_logging(level=settings.log_level, fmt=fmt)
 
-    if transport == "stdio" and Path(".env").is_file():
-        logger.warning(
-            "ignoring the .env in this directory: the stdio transport reads real "
-            "environment variables only. Set them in your MCP client's env block.",
-            extra={"cwd": str(Path.cwd())},
-        )
+    if transport == "stdio":
+        ignored = _recognised_dotenv_keys(Path(".env"))
+        if ignored:
+            logger.warning(
+                "ignoring %s in %s: the stdio transport reads real environment "
+                "variables only. Set them in your MCP client's env block.",
+                ", ".join(ignored),
+                Path.cwd(),
+            )
+        if args.host is not None or args.port is not None:
+            logger.warning("--host and --port do nothing under the stdio transport")
 
     logger.info(
         "MCP YouTube starting",
@@ -368,7 +409,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     server = build_server(settings)
 
-    if settings.mcp_transport == "stdio":
+    if transport == "stdio":
         # No host/port: the client owns the process lifetime. The banner is
         # suppressed because FastMCP has written it to stdout in some versions,
         # and on this transport stdout is the wire.
