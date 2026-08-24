@@ -3,13 +3,16 @@
 Two tools, single-user, stateless. Self-throttles to keep YouTube from
 banning the server's IP (1 request per 5-10 seconds with random jitter).
 
-Transport: Streamable HTTP via FastMCP (current MCP spec).
+Transport: stdio by default (local, client-spawned); Streamable HTTP when
+MCP_TRANSPORT=http, which is what the Docker image sets.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
+import os
 from typing import Any
 
 from fastmcp import FastMCP
@@ -235,15 +238,62 @@ def build_server(
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
-    """CLI entrypoint used by the Docker image."""
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse the CLI flags. Everything here also has an env var equivalent."""
+    parser = argparse.ArgumentParser(
+        prog="mcp-youtube",
+        description=(
+            "MCP server that fetches YouTube transcripts and shapes them as "
+            "research-ready markdown."
+        ),
+    )
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "http"],
+        default=None,
+        help=(
+            "stdio (default): the MCP client spawns this process and talks over "
+            "stdin/stdout. http: serve Streamable HTTP on MCP_HOST:MCP_PORT. "
+            "Overrides the MCP_TRANSPORT env var."
+        ),
+    )
+    parser.add_argument("--version", action="version", version=f"mcp-youtube {__version__}")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    """CLI entrypoint for both transports.
+
+    Defaults to stdio so that ``uvx mcp-youtube`` (or any MCP client spawning
+    this command) just works with nothing to install and no port to keep
+    listening. The Docker image sets ``MCP_TRANSPORT=http`` to get the
+    long-lived Streamable HTTP server instead.
+    """
+    args = _parse_args(argv)
     settings = load_settings()
-    configure_logging(level=settings.log_level, fmt=settings.log_format)
+    if args.transport:
+        settings.mcp_transport = args.transport
+
+    # Under stdio a human is usually watching the terminal, so plain text beats
+    # JSON lines. An explicit LOG_FORMAT always wins.
+    fmt = settings.log_format
+    if settings.mcp_transport == "stdio" and "LOG_FORMAT" not in os.environ:
+        fmt = "text"
+    configure_logging(level=settings.log_level, fmt=fmt)
+
     logger.info(
         "MCP YouTube starting",
         extra={"version": __version__, "config": settings.safe_repr()},
     )
     server = build_server(settings)
+
+    if settings.mcp_transport == "stdio":
+        # No host/port: the client owns the process lifetime. The banner is
+        # suppressed because FastMCP has written it to stdout in some versions,
+        # and on this transport stdout is the wire.
+        server.run(transport="stdio", show_banner=False)
+        return
+
     server.run(
         transport="streamable-http",
         host=settings.mcp_host,

@@ -92,7 +92,11 @@ def configure_logging(level: str = "INFO", fmt: str = "json") -> None:
     for handler in list(root.handlers):
         root.removeHandler(handler)
 
-    handler = logging.StreamHandler(stream=sys.stdout)
+    # stderr, never stdout. Under the stdio transport, stdout IS the JSON-RPC
+    # channel — a single log line written there corrupts the framing and the
+    # client drops the connection. Docker captures stderr the same as stdout,
+    # so the HTTP/container path loses nothing by this.
+    handler = logging.StreamHandler(stream=sys.stderr)
     if fmt == "json":
         handler.setFormatter(JsonFormatter())
     else:

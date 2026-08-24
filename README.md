@@ -25,6 +25,99 @@ Both tools return JSON strings using a uniform contract:
 - Success: `{"data": ...}`
 - Failure: `{"error": "...", "code": "INVALID_INPUT" | "NOT_FOUND" | "RATE_LIMITED" | "UPSTREAM_DOWN" | "INTERNAL", "details": {...}}`
 
+## Install
+
+Two ways to run this, and the first one is almost certainly the one you want.
+
+### On your own machine (no Docker, nothing left running)
+
+The server speaks [stdio](https://modelcontextprotocol.io/docs/concepts/transports)
+by default, which means your MCP client starts it on demand and stops it when
+it's done. There is no port to pick, no daemon to babysit, and no container.
+
+With [uv](https://docs.astral.sh/uv/) installed, this is the whole install:
+
+```bash
+claude mcp add youtube -- \
+  uvx --from git+https://github.com/pete-builds/mcp-server-youtube-transcript-scraper \
+  mcp-youtube
+```
+
+That's it. `uvx` fetches the code, builds it in a throwaway environment, and
+downloads a matching Python for you if you don't have one, so the
+`requires-python = ">=3.13"` pin is not something you have to satisfy yourself.
+
+For any other MCP client, the same thing as config:
+
+```json
+{
+  "mcpServers": {
+    "youtube": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/pete-builds/mcp-server-youtube-transcript-scraper",
+        "mcp-youtube"
+      ]
+    }
+  }
+}
+```
+
+On Claude Desktop that file is `claude_desktop_config.json`
+(macOS: `~/Library/Application Support/Claude/`, Windows: `%APPDATA%\Claude\`).
+
+Prefer pip? Same result, one more step:
+
+```bash
+pip install git+https://github.com/pete-builds/mcp-server-youtube-transcript-scraper
+claude mcp add youtube -- mcp-youtube
+```
+
+No `.env` is needed for any of this. The defaults are the local-friendly ones:
+stdio transport, loopback bind, plain-text logs on stderr.
+
+### As an always-on server (Docker)
+
+Use this when you want one shared instance on a homelab box rather than a copy
+per laptop. It serves Streamable HTTP at `/mcp` instead of stdio.
+
+```bash
+git clone https://github.com/pete-builds/mcp-server-youtube-transcript-scraper.git
+cd mcp-server-youtube-transcript-scraper
+cp .env.example .env
+docker compose up -d --build
+```
+
+```bash
+claude mcp add youtube --transport http --url http://localhost:3716/mcp
+```
+
+You can also get the HTTP server without Docker, if you want it under your own
+process manager:
+
+```bash
+mcp-youtube --transport http        # or: MCP_TRANSPORT=http mcp-youtube
+```
+
+### Check it worked
+
+```
+> fetch_transcript("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+```
+
+The first call takes 5-10 seconds on purpose. See
+[Anti-ban hardening](#anti-ban-hardening).
+
+## Transports
+
+| | stdio | http |
+|---|---|---|
+| Who starts the process | your MCP client, on demand | you, and it stays up |
+| Needs a port | no | yes (`MCP_PORT`, default 3716) |
+| Good for | one person, one machine | a shared/homelab instance |
+| Select with | default | `--transport http` or `MCP_TRANSPORT=http` |
+
 ## Anti-ban hardening
 
 YouTube doesn't expose a free transcript API; this server scrapes the same
@@ -39,12 +132,13 @@ the server can get IP-banned if it hammers YouTube. Defaults:
   deepen the ban.
 - **Webshare proxy slot reserved:** `WEBSHARE_PROXY_USERNAME` and
   `WEBSHARE_PROXY_PASSWORD` env vars are read at startup and logged. They
-  are NOT wired into the fetch path in v0.1 — that lands in v0.2 if needed.
+  are NOT wired into the fetch path yet. Setting them changes nothing today.
 
 ## Configuration
 
-Copy `.env.example` to `.env` and edit. All settings are optional with
-sensible defaults; see `src/mcp_youtube/config.py` for the full list.
+Everything here is optional and the defaults are sane, so a local stdio
+install needs no configuration at all. For the Docker deployment, copy
+`.env.example` to `.env` and edit. Full list in `src/mcp_youtube/config.py`.
 
 | Env var | Default | Purpose |
 |---------|---------|---------|
@@ -52,51 +146,22 @@ sensible defaults; see `src/mcp_youtube/config.py` for the full list.
 | `RATE_LIMIT_MAX_SECONDS` | `10` | Upper bound (with jitter) |
 | `DEFAULT_LANGUAGE` | `en` | Primary preferred caption language |
 | `FALLBACK_LANGUAGES` | `en-US,en-GB` | Comma-separated fallbacks |
-| `WEBSHARE_PROXY_USERNAME` | _(unset)_ | Reserved (v0.2) |
-| `WEBSHARE_PROXY_PASSWORD` | _(unset)_ | Reserved (v0.2) |
-| `MCP_HOST` | `0.0.0.0` | Bind host inside the container |
-| `MCP_PORT` | `3716` | TCP port |
+| `WEBSHARE_PROXY_USERNAME` | _(unset)_ | Reserved, not yet wired |
+| `WEBSHARE_PROXY_PASSWORD` | _(unset)_ | Reserved, not yet wired |
+| `MCP_TRANSPORT` | `stdio` | `stdio` or `http`. The Docker image sets `http` |
+| `MCP_HOST` | `127.0.0.1` | Bind host, `http` only. The Docker image sets `0.0.0.0` |
+| `MCP_PORT` | `3716` | TCP port, `http` only |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
-| `LOG_FORMAT` | `json` | `json` (production) or `text` (dev) |
+| `LOG_FORMAT` | `text` under stdio, else `json` | `json` (production) or `text` (dev). Always written to stderr |
 
-## Run
-
-### Clone
+## Development
 
 ```bash
 git clone https://github.com/pete-builds/mcp-server-youtube-transcript-scraper.git
 cd mcp-server-youtube-transcript-scraper
-```
-
-### Docker (recommended)
-
-```bash
-cp .env.example .env
-docker compose up -d --build
-```
-
-The server listens on `${MCP_PORT:-3716}` over Streamable HTTP at `/mcp`.
-
-### Direct
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
+python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-python -m mcp_youtube.server
-```
-
-## Register as an MCP client
-
-```bash
-# Claude Code (Streamable HTTP transport)
-claude mcp add youtube --transport http --scope user --url http://localhost:3716/mcp
-```
-
-Then in any Claude session:
-
-```
-fetch_transcript("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+mcp-youtube --help
 ```
 
 ## Testing

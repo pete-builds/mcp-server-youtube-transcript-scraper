@@ -67,7 +67,16 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # MCP server settings
     # ------------------------------------------------------------------
-    mcp_host: str = Field(default="0.0.0.0")
+    mcp_transport: Literal["stdio", "http"] = Field(
+        default="stdio",
+        description=(
+            "How the client talks to this server. 'stdio' (default) lets an MCP "
+            "client spawn the process and speak over stdin/stdout — no port, no "
+            "daemon, nothing to keep running. 'http' serves Streamable HTTP on "
+            "MCP_HOST:MCP_PORT and is what the Docker image sets."
+        ),
+    )
+    mcp_host: str = Field(default="127.0.0.1")
     mcp_port: int = Field(default=3716, ge=1, le=65535)
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(default="INFO")
     log_format: Literal["json", "text"] = Field(default="json")
@@ -96,6 +105,7 @@ class Settings(BaseSettings):
             "webshare_proxy_configured": bool(
                 self.webshare_proxy_username and self.webshare_proxy_password
             ),
+            "mcp_transport": self.mcp_transport,
             "mcp_host": self.mcp_host,
             "mcp_port": self.mcp_port,
             "log_level": self.log_level,
