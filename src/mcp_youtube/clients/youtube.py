@@ -17,11 +17,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-
-import requests
 import time
 from dataclasses import dataclass
 from typing import Any
+
+import requests
 
 logger = logging.getLogger("mcp_youtube.client")
 
