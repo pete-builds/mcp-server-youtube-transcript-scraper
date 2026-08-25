@@ -17,11 +17,38 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+
+import requests
 import time
 from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger("mcp_youtube.client")
+
+
+
+class _TimeoutSession(requests.Session):
+    """A requests Session that applies a default timeout to every request.
+
+    requests has no global timeout setting; it is a per-call keyword. Subclassing
+    and defaulting it is the only way to bound a session handed to third-party
+    code that never passes one.
+    """
+
+    def __init__(self, timeout: float) -> None:
+        super().__init__()
+        self._timeout = timeout
+
+    def request(self, *args: Any, **kwargs: Any) -> Any:  # type: ignore[override]
+        kwargs.setdefault("timeout", self._timeout)
+        return super().request(*args, **kwargs)
+
+
+DEFAULT_HTTP_TIMEOUT_SECONDS = 30.0
+
+
+def _timeout_session(timeout: float) -> _TimeoutSession:
+    return _TimeoutSession(timeout)
 
 
 class TranscriptError(Exception):
@@ -73,7 +100,9 @@ class YouTubeTranscriptClient:
         rate_limit_max_seconds: float,
         webshare_proxy_username: str = "",
         webshare_proxy_password: str = "",
+        http_timeout_seconds: float = DEFAULT_HTTP_TIMEOUT_SECONDS,
     ) -> None:
+        self._http_timeout = max(1.0, http_timeout_seconds)
         self._min = max(0.0, rate_limit_min_seconds)
         self._max = max(self._min, rate_limit_max_seconds)
         self._webshare_username = webshare_proxy_username
@@ -98,7 +127,23 @@ class YouTubeTranscriptClient:
         # environment without the upstream library installed.
         from youtube_transcript_api import YouTubeTranscriptApi  # type: ignore[import-not-found]
 
-        self._api = YouTubeTranscriptApi()
+        # The upstream library builds a bare requests.Session when handed no
+        # http_client, and a bare Session has NO default timeout -- there is not a
+        # single `timeout` anywhere in the library's own source. A stalled socket
+        # therefore blocked its worker thread forever.
+        #
+        # Nothing else bounded it either: FastMCP's per-tool timeout is unset, the
+        # web server does not time out in-flight requests, and the default thread
+        # pool is min(32, cpu+4) -- six workers on a 2-vCPU container. Six wedged
+        # sockets blocked every subsequent fetch permanently. Worse, /health is an
+        # async route on the event loop, which stays green while every worker
+        # thread is stuck, so `restart: unless-stopped` never fired.
+        #
+        # The timeout has to go HERE and not on the tool. anyio.fail_after cancels
+        # the awaiting coroutine, but work already running inside asyncio.to_thread
+        # cannot be cancelled -- a tool timeout would hide the hang and leave the
+        # thread leaked.
+        self._api = YouTubeTranscriptApi(http_client=_timeout_session(self._http_timeout))
         return self._api
 
     async def _await_rate_limit(self) -> None:
