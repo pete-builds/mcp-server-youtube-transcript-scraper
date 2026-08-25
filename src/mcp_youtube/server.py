@@ -37,6 +37,36 @@ from mcp_youtube.logging_setup import configure_logging
 
 logger = logging.getLogger("mcp_youtube.server")
 
+# --- Tool annotations ---
+# Two tools, neither of which writes anything anywhere. This server is
+# stateless by design: fetch_transcript returns a string and
+# format_transcript_as_research returns a string, and the CALLER writes to disk
+# in their own workspace. Saying so in the manifest is what lets a client tell
+# this apart from a server that would have written the file itself.
+#
+# The two differ in exactly one hint, and it is the interesting one.
+
+#: Fetches a transcript from YouTube. Read-only, but open-world: it reaches an
+#: external service, and an answer can change between two identical calls
+#: because a caption track was added or removed.
+READ_REMOTE = {
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": True,
+}
+
+#: Pure formatting. No network I/O, no rate limiting, no disk. Given the same
+#: arguments it returns the same markdown forever, so it is the one genuinely
+#: closed-world tool here -- worth marking, because a client can call it
+#: freely without it counting against anything or reaching anyone.
+FORMAT_LOCAL = {
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": False,
+}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -95,7 +125,7 @@ def build_server(
     # Tools
     # ------------------------------------------------------------------
 
-    @mcp.tool()
+    @mcp.tool(annotations=READ_REMOTE)
     async def fetch_transcript(url_or_id: str, language: str = "") -> str:
         """Fetch the transcript for a YouTube video.
 
@@ -170,7 +200,7 @@ def build_server(
             }
         )
 
-    @mcp.tool()
+    @mcp.tool(annotations=FORMAT_LOCAL)
     async def format_transcript_as_research(
         transcript: str,
         video_id: str,
