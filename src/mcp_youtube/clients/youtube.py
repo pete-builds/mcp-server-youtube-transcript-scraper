@@ -26,7 +26,6 @@ import requests
 logger = logging.getLogger("mcp_youtube.client")
 
 
-
 class _TimeoutSession(requests.Session):
     """A requests Session that applies a default timeout to every request.
 

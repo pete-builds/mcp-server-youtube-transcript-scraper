@@ -1,5 +1,3 @@
-
-
 class TestHttpTimeout:
     """A bare requests.Session has no default timeout, and the upstream library
     builds one when handed no http_client. A stalled socket then blocks its
