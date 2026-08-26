@@ -7,7 +7,7 @@ x-logging: &default-logging
 services:
   mcp-youtube:
     build: .
-    image: mcp-youtube:0.2.0
+    image: mcp-youtube:0.3.0
     container_name: mcp-youtube
     restart: unless-stopped
     read_only: true
